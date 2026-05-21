@@ -1,0 +1,317 @@
+\documentclass[11pt]{article}
+\usepackage{booktabs}
+% Change "review" to "final" to generate the final (sometimes called camera-ready) version
+\usepackage[review]{acl}
+
+% Standard package includes
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+% This is not strictly necessary, and may be commented out,
+% but it will improve the layout of the manuscript,
+% and will typically save some space.
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+
+\title{Mechanistic Interpretability of a Small Language Model: Natural Language Processing Final Project}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+\author{Artur Safrastyan \\
+  nlp\_project \\
+  \texttt{artur.safrastyan@email.com}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Mechanistic interpretability aims to reverse-engineer transformer computational graphs into human-understandable algorithms. This study presents a mechanistic interpretability analysis of GPT-2-small (124M parameters), reverse-engineering internal attention mechanisms to map specific algorithmic behaviors to discrete circuit ensembles. We study structural copying (induction heads) and semantic processing (Indirect Object Identification) in GPT-2 Small using attention analysis, direct logit attribution, activation patching, and zero-ablation. Observational analysis identifies the ensemble of attention heads responsible for induction in middle layers. Causal activation patching reveals that while patching a single head (L5H5) yields a marginal logit recovery (+0.39), patching the full induction ensemble recovers +5.67 logits, demonstrating circuit-level coordination. Under zero-ablation on an in-context sequence continuation task, knocking out the top 10 induction heads collapses the model's confidence by -64.0\% (from 75.8\% to 11.8\%), whereas a control ablation of 10 random heads yields a smaller -7.7\% drop. Transitioning to semantic circuits, Layer 9 Head 9 (L9H9) is identified as a Name Mover Head. Zero-ablating the primary Name Mover circuit (9.9, 9.6, and 10.0) causes a minimal logit drop from 4.73 to 4.49, empirically validating the presence of Backup Name Mover Heads that compensate for circuit failure. Our findings demonstrate that while small models possess clear and identifiable circuits, their capabilities are highly distributed and redundant, presenting important implications for structural scaling theories.
+\end{abstract}
+
+\section{Introduction}
+
+In recent years, Transformer-based Large Language Models (LLMs) have achieved state-of-the-art performance across a vast array of natural language processing tasks, displaying emergent capabilities in reasoning, translation, and few-shot learning. However, despite their immense success, these models remain notorious "black boxes." Their computational processes are distributed across billions of parameters, operating in high-dimensional vector spaces through dense, non-linear interactions. This structural obscurity poses a significant challenge: without a detailed understanding of how these networks compute their outputs, it is exceedingly difficult to guarantee their safety, anticipate out-of-distribution failures, or ensure alignment with human intent. Traditional interpretability methods, such as linear probing or saliency maps, usually show only vague patterns and correlations rather than explaining the actual causal mechanisms behind how a model behaves. While they can tell us which parts of an input a model is looking at, they do not reveal the internal step-by-step reasoning the model used to arrive there.
+
+To bridge this gap, the emerging field of \textit{Mechanistic Interpretability} seeks to reverse-engineer neural networks by mapping their internal weights and activations directly to human-understandable algorithms. Drawing inspiration from computational neurobiology and software debugging, this paradigm conceptualizes a language model as a complex computational graph. By analyzing the flow of information through the residual stream, researchers can isolate discrete subgraphs, referred to as "circuits," that are responsible for executing specific, localized behaviors.
+
+This paper investigates two fundamental computational circuits within the GPT-2 Small (124M parameters) architecture:
+\begin{itemize}
+    \item \textbf{The Structural Copying Circuit (Induction Heads):} The mechanism responsible for In-Context Learning (ICL) and exact pattern repetition is analyzed. Using synthetic sequence continuation datasets, these heads are isolated and their causal influence verified.
+    \\\
+    \item \textbf{The Semantic Name-Moving Circuit (Indirect Object Identification):} We analyze how the model resolves grammatical dependencies in templated clauses (e.g., identifying the indirect object in sentences like \textit{"John and Mary went to the store; John gave a bottle of milk to [Mary]"}).
+\end{itemize}
+
+The primary goal of this paper is to reverse-engineer these structural copying and semantic name-moving capabilities in a controlled, small-scale setting. By applying attention-pattern analysis, direct logit attribution (logit lens), and causal activation patching, we provide quantitative evidence demonstrating how these internal pathways work. Additionally, we perform targeted zero-ablation experiments to validate our circuit-level hypotheses. We replicate key findings from foundational literature on induction dynamics and semantic circuit redundancy, specifically demonstrating how GPT-2 Small handles model capacity constraints and uses "backup" attention heads to maintain performance under structural damage.
+
+\section{Background \& Related Work}
+
+\subsection{The Math of Transformers: Residual Streams and Factored Circuits}
+
+To understand how a transformer processes information, it is helpful to discard the view of layers as independent, sequential blocks and instead view them as agents writing to and reading from a shared communication channel referred to as the \textit{residual stream}.
+
+Mathematically, the residual stream at layer $l$ is represented as a vector $x_l \in \mathbb{R}^{N \times d}$, where $N$ is the sequence length (context window) and $d$ is the model's hidden dimension. The model begins by embedding the input tokens using an embedding matrix $W_E \in \mathbb{R}^{|V| \times d}$ and adding positional embeddings $W_p \in \mathbb{R}^{N \times d}$ to form the initial state $x_0$:
+\begin{equation}
+    x_0 = t W_E + W_p
+\end{equation}
+
+Each subsequent layer $l$ reads from this stream, performs its internal computations via Multi-Head Attention ($\text{MHA}_l$) and Multi-Layer Perceptrons ($\text{MLP}_l$), and writes its output back to the stream via vector addition:
+\begin{equation}
+    x_l = x_{l-1} + \text{MHA}_l(x_{l-1}) + \text{MLP}_l(x_{l-1})
+\end{equation}
+
+Because information is added rather than replaced, the residual stream acts like a shared workspace." Early layers write basic features (like token identity and position), while later layers read those features, refine them, and write complex semantic representations. The final prediction logits are obtained by projecting the final state $x_L$ through the unembedding matrix $W_U \in \mathbb{R}^{d \times |V|}$.
+
+As formalized by \citet{Elhage2021}, we can dissect the operations of an individual attention head $h$ in layer $l$ by decomposing it into two independent, factored circuits. An attention head $h$ takes the residual stream $x_{l-1}$ and produces an output matrix $h(x_{l-1}) \in \mathbb{R}^{N \times d}$. By ignoring the non-linear LayerNorm for a moment, we can express the head's operation on a destination token at position $c$ attending to a source token at position $r$ as:
+\begin{equation}
+    \text{Attn}^h(x)_{c} = \sum_{r=1}^{c} A^h_{c,r} \cdot x_{r} W_V^h W_O^h
+\end{equation}
+where $W_V^h \in \mathbb{R}^{d \times d_v}$ and $W_O^h \in \mathbb{R}^{d_v \times d}$ are the value and output projection matrices, respectively.
+
+The weight $A^h_{c,r}$ is the attention paid by destination token $c$ to source token $r$, calculated using the softmax function over the Query-Key inner product:
+\begin{equation}
+    A^h_{c,r} = \text{softmax} \left( \frac{(x_c W_Q^h)(x_r W_K^h)^T}{\sqrt{d_k}} \right)_{c,r}
+\end{equation}
+where $W_Q^h \in \mathbb{R}^{d \times d_k}$ and $W_K^h \in \mathbb{R}^{d \times d_k}$ are the query and key projection matrices. This mathematical formulation allows us to factor the head into two distinct circuits:
+\begin{enumerate}
+    \item \textbf{The Query-Key (QK) Circuit ($W_{QK}^h = W_Q^h (W_K^h)^T \in \mathbb{R}^{d \times d}$):} This circuit determines \textit{where} the head looks. It computes the attention pattern $A^h$ by measuring the bilinear similarity between tokens:
+    \begin{equation}
+        A^h \approx \text{softmax} \left( \frac{x W_{QK}^h x^T}{\sqrt{d_k}} \right)
+    \end{equation}
+    \item \textbf{The Output-Value (OV) Circuit ($W_{OV}^h = W_V^h W_O^h \in \mathbb{R}^{d \times d}$):} This circuit determines \textit{what} the head writes. Once $A^h$ is established, the head moves information from the source token $x_r$ to the destination $c$ by applying the linear transformation $W_{OV}^h$:
+    \begin{equation}
+        \text{Output}_c = \sum_{r} A^h_{c,r} (x_r W_{OV}^h)
+    \end{equation}
+\end{enumerate}
+This factoring means one can mathematically analyze what a head attends to (via the $W_{QK}^h$ matrix) separately from what information it moves and writes to the residual stream (via the $W_{OV}^h$ matrix).
+
+\subsection{Literature Review}
+
+\subsubsection{Induction Heads and In-Context Learning}
+
+First hypothesized by \citet{Elhage2021} and recently quantified by \citet{crosbie2024}, induction heads are specialized attention heads that implement a simple pattern-matching rule: $[A][B] \dots [A] \rightarrow [B]$. When the model encounters a token $[A]$, the induction head searches the historical context for previous occurrences of $[A]$ (using prefix matching via its QK circuit) and then copies the token $[B]$ that immediately followed it to the output distribution (using copying via its OV circuit).
+
+Importantly, \citet{Elhage2021} proved that \textbf{induction is mathematically impossible in a 1-layer attention-only model}. In a 1-layer model, the key vector at position $i+1$ (token $[B]$) has access only to $x_{i+1}$ (the token embedding of $[B]$) and its positional embedding. It cannot "know" that the token preceding it at position $i$ was $[A]$.
+
+To resolve this, induction requires a 2-layer structure mediated by the residual stream. This is achieved via Key-Composition ($K$-composition), where an upstream head $h_1$ in Layer 0 acts as a Previous-Token Head, moving the identity of the token at position $i$ ($[A]$) to the representation of the token at position $i+1$ ($[B]$):
+\begin{equation}
+    x_{i+1} \leftarrow x_{i+1} + \text{Attn}^{h_1}(x_{i}) W_{OV}^{h_1}
+\end{equation}
+
+In Layer 1, the induction head $h_2$ queries the current token $[A]$ at the final position $t$ ($x_t W_Q^{h_2}$). The key vector at position $i+1$ now reads the previous-token feature written by $h_1$:
+\begin{equation}
+    K^{h_2}(x_{i+1}) \approx \left( x_{i+1} + x_i W_{OV}^{h_1} \right) W_K^{h_2}
+\end{equation}
+
+This allows the QK circuit of the induction head to compute a high attention weight between position $t$ and position $i+1$:
+\begin{equation}
+    A^{h_2}_{t, i+1} \propto \exp \left( \frac{(x_t W_Q^{h_2})(x_i W_{OV}^{h_1} W_K^{h_2})^T}{\sqrt{d_k}} \right)
+\end{equation}
+
+Once attention is directed to position $i+1$ ($[B]$), the OV circuit ($W_{OV}^{h_2}$) copies the vector for $[B]$ to the residual stream at position $t$, allowing the unembedding layer ($W_U$) to predict $[B]$ as the next token.
+
+\citet{Olsson2022} observed that the emergence of these induction heads during training directly coincides with a sudden, sharp drop in the model's training loss, implying that these heads are the primary reason behind a model's ability to learn from context (In-Context Learning, or ICL). \citet{crosbie2024} provided the first direct causal evidence of this link in modern, large-scale architectures like Llama-3-8B and InternLM2-20B. By mean-ablating the top 1\% to 3\% of induction heads, they observed catastrophic performance drops on abstract pattern-recognition tasks, reducing few-shot accuracies to near-random levels and proving that induction heads are causally necessary for abstract ICL.
+
+\subsubsection{The Indirect Object Identification (IOI) Circuit and Redundancy}
+
+In their seminal paper "Interpretability in the Wild", \citet{wang2022} mapped the exact neural circuit GPT-2 Small uses to solve the Indirect Object Identification (IOI) task. Given a prompt like \textit{"When Mary and John went to the store, John gave a drink to..."}, the model must predict \textit{"Mary"}.
+
+\citet{wang2022} formalized the evaluation of this circuit by measuring the logit difference between the correct Indirect Object ($\text{IO}$) and the incorrect Subject ($\text{S}$):
+\begin{equation}
+    \Delta L = \text{logit}(\text{IO}) - \text{logit}(\text{S}) = (x_L W_U)_{\text{IO}} - (x_L W_U)_{\text{S}}
+\end{equation}
+
+By expanding $x_L$ into the sum of the outputs of all attention heads, they isolated the causal contribution of each individual head to the final prediction, mapping them to three functional classes of heads:
+\begin{enumerate}
+    \item \textbf{Duplicate Token Detectors:} Identify which names are repeated in the context (e.g., noting that "John" has appeared twice).
+    \item \textbf{S-Inhibition Heads:} Read the output of duplicate detectors and inhibit the repeated name ("John") at the final token position.
+    \item \textbf{Name Mover Heads:} Gather the remaining uninhibited name ("Mary") and write its vector directly into the residual stream at the final position, boosting its probability in the final unembedding layer.
+\end{enumerate}
+
+In Section 3.4 of their paper, \citet{wang2022} discovered the phenomenon of circuit redundancy. When they zero-ablated the primary Name Mover Heads (such as heads 9.9, 9.6, and 10.0), the model's ability to output the correct name did not collapse. Instead, other attention heads in subsequent layers, which they termed as \textit{Backup Name Mover Heads}, automatically increased their attention to the correct name, compensating for the lost activations.
+
+Mechanistically, this compensation is mediated by two distinct mechanisms:
+\begin{itemize}
+    \item \textbf{LayerNorm Calibration:} The LayerNorm operation normalizes a vector $x$ by its standard deviation $\sigma$:
+    \begin{equation}
+        \text{LN}(x) = \frac{x - \mu}{\sigma} \odot \gamma + \beta
+    \end{equation}
+    When primary Name Movers are ablated, the variance of the residual stream entering subsequent layers decreases, resulting in a smaller denominator $\sigma$. This automatically scales up the activation strength of all remaining signals, effectively magnifying the write-strength of the Backup Name Mover heads.
+    \item \textbf{Active Compensation (Compositional Feedbacks):} Downstream backup heads change their attention patterns dynamically because the input vectors they read (which compose with upstream outputs) are altered, causing the backup heads to attend more strongly to the $\text{IO}$ name.
+\end{itemize}
+This discovery revealed that neural networks do not rely on single-wire paths, but instead construct resilient, ensemble-like pathways to safeguard critical computational processes.
+
+\section{Experimental Setup \& Datasets}
+
+\subsection{Model Selection and Preprocessing}
+
+For all experiments, I have used GPT-2 Small (124M parameters), a 12-layer decoder-only transformer with 12 attention heads per layer, a hidden dimension $d_{\text{model}} = 768$, and a head dimension $d_{\text{head}} = 64$. GPT-2 Small is selected as the experimental subject because it is the smallest standard language model that exhibits non-trivial circuits for both induction and Indirect Object Identification (IOI), which makes it the benchmark model of choice in foundational mechanistic interpretability studies. 
+
+To analyze the model's internal activations linearly and isolate circuit behaviors without interference from architectural artifacts, GPT-2 Small was imported into the \texttt{TransformerLens} library and several standard interpretability preprocessing configurations were applied:
+\begin{itemize}
+    \item \textbf{Centering Unembedding and Writing Weights:} Constant offsets in the unembedding weights ($W_U$) and bias vectors can distort calculations of logit attribution. Centering these weights ensures that the residual stream represents zero-mean activation distributions, which makes direct logit projections algebraically clean.
+    \item \textbf{Folding Layer Normalization:} Non-linear LayerNorm scaling factors vary dynamically across forward passes, thus introducing non-linearities between layers. LayerNorm parameters were "folded", to scale the adjacent weight matrices ($W_Q, W_K, W_V, W_{MLP}$) directly by the static bias and gain parameters. This linearizes the mathematical operations between the residual stream and the attention heads.
+    \item \textbf{Refactoring Factored Attention Matrices:} This directly factors attention matrices into their constituent QK and OV components, allowing me to perform clean mathematical interventions on specific sub-circuits.
+\end{itemize}
+
+\subsection{Dataset Engineering and Prompt Control}
+
+To isolate specific behaviors, I have constructed three distinct and controlled datasets:
+
+\begin{enumerate}
+    \item \textbf{Synthetic Repeated Sequence ($A \rightarrow A$):} Used to calculate induction scores. It consists of a prefix of 50 random tokens $A = [X_1, X_2, \dots, X_{50}]$ (excluding vocabulary outliers) duplicated to form a 100-token sequence:
+    \begin{equation}
+        [X_1, X_2, \dots, X_{50}, X_1, X_2, \dots, X_{50}]
+    \end{equation}
+    The target is the exact repetition of the first half.
+    \item \textbf{Exact Sequence Continuation Prompt:} A few-shot prompt designed to evaluate abstract pattern matching in-context. It presents a sequence of single-token nouns in an arbitrary order and prompts the model to repeat that sequence exactly.
+    An example 3-shot prompt is structured as follows:
+    \begin{align*}
+        \text{Input: } & \texttt{cat dog apple tree cat dog apple } \\
+        \text{Target: } & \texttt{tree}
+    \end{align*}
+    \item \textbf{Templated IOI Dataset:} Modeled after \citet{wang2022}, this dataset features grammatical templates where two names are introduced, and one is repeated as the subject of the clause, making the other name the correct indirect object target.
+    \begin{itemize}
+        \item \textbf{Clean Prompt:} \texttt{"[Name A] and [Name B] went to the [Place]. [Name A] gave a [Object] to"}
+        \item \textbf{Clean Target:} \texttt{[Name B]}
+        \item \textbf{Example:} \texttt{"John and Mary went to the store. John gave a book to "} $\rightarrow$ Target: \texttt{Mary}.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{The Necessity of Clean-Corrupted Pairs in Causal Intervention}
+
+Causal mediation analysis, specifically implemented via activation patching, is used to trace how information flows through the model. To run activation patching, one must construct a matched pair of prompts: a \textit{clean} prompt (which produces the correct target output) and a \textit{corrupted} prompt (which is structurally identical but lacks the specific informational feature, leading to an incorrect output). 
+
+For example, in the IOI circuit, if the clean prompt is \texttt{"John and Mary went... John gave a book to"} (Target: \texttt{Mary}), the corrupted prompt is constructed by changing the names to break the name-moving logic: \texttt{"John and John went... John gave a book to"} (Target: \texttt{John}).
+
+If we were to simply zero-ablate a head (setting its activations to zero), we would introduce out-of-distribution (OOD) noise that can cause cascading failures throughout the network, making it difficult to distinguish between the loss of a specific algorithm and a general model breakdown. Instead, I perform activation patching by running a forward pass on the corrupted input, but replacing the activation of a target head $h$ at layer $l$ with its activation from the clean pass:
+
+\begin{equation}
+    h(x^{\text{corrupted}}_{l-1}) \leftarrow h(x^{\text{clean}}_{l-1})
+\end{equation}
+
+By measuring the percentage of the clean logit difference $\Delta L$ that is restored after patching this single component, a, causal metric of mediation is established. This requires clean-corrupted pairs because we are measuring how much of the clean model's "information" is carried by that specific node in the context of an otherwise corrupted run.
+\section{Observational Analysis \& The OV Circuit}
+
+\subsection{Attention Pattern Analysis}
+
+To identify active induction heads in GPT-2 Small, I computed prefix matching scores on the synthetic repeated sequence dataset. An attention head $h$ is mathematically defined as performing prefix matching if, when processing a query at position $t$ (representing token $X_k$ in the second repeat), it allocates substantial attention weight to position $i+1$ (the token immediately following the previous occurrence of $X_k$ in the first repeat):
+
+\begin{equation}
+    \text{Induction Score}^h = \mathbb{E} \left[ A^h_{t, i+1} \right]
+\end{equation}
+
+By running a forward pass over the synthetic repeated dataset, I cached the attention patterns for all 144 heads and computed their mean induction scores. The top ten induction heads, sorted by their average induction attention scores, are presented in Table \ref{tab:induction_heads}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+\textbf{Rank} & \textbf{Head (Layer, Index)} & \textbf{Induction Score} \\
+\midrule
+1  & (5, 5)  & 0.9150 \\
+2  & (5, 1)  & 0.8414 \\
+3  & (7, 10) & 0.8270 \\
+4  & (6, 9)  & 0.8223 \\
+5  & (7, 2)  & 0.6335 \\
+6  & (10, 7) & 0.5931 \\
+7  & (5, 0)  & 0.5366 \\
+8  & (10, 1) & 0.5321 \\
+9  & (9, 6)  & 0.4852 \\
+10 & (11, 10)& 0.4435 \\
+\bottomrule
+\end{tabular}
+\caption{Top ten candidate induction heads in GPT-2 Small identified by their average attention score on repeated sequences.}
+\label{tab:induction_heads}
+\end{table}
+
+\subsection{Direct Logit Attribution (Logit Lens)}
+
+To confirm whether these induction heads write copy-signals directly to the output vocabulary, I applied the logit lens to the highest-performing head, Layer 5 Head 5 (L5H5). The logit lens bypasses the rest of the network by projecting the output of a specific attention head ($z W_O^h$, where $z$ is the pre-projection output at the final position) directly through the unembedding matrix $W_U$:
+
+\begin{equation}
+    L^{L5H5}_{\text{attribution}} = (z^{L5H5} W_O^{L5H5}) W_U
+\end{equation}
+
+Projecting this vector yields the direct attribution of L5H5 to the vocabulary logits. The analysis revealed that L5H5 boosts the logit of the correct target token by an average of +4.7380, whereas the average logit for all other tokens in the vocabulary remains at 0.0000. This shows that the head output vector aligns directly with the direction of the target token's unembedding vector. This proves that the OV circuit is directly responsible for writing the target token's identity into the residual stream.
+
+\section{Causal Interventions (Activation Patching)}
+
+\subsection{Methodology}
+
+While direct logit attribution is observational, I used activation patching to establish causal necessity. I generated a corrupted input by changing the source token at position $N-1$, breaking the repeated pattern and causing the base model to predict an incorrect token. 
+
+I then ran a forward pass on the corrupted sequence, but patched the clean activations of L5H5 into the corrupted run. If the target token's logit is restored, it proves that the patched component is responsible for the copying behavior.
+
+\subsection{Single vs. Ensemble Patching}
+
+The base results for predicting the original target token are as follows:
+\begin{itemize}
+    \item \textbf{Clean Logit Baseline:} 14.9469 (Probability: 0.5592)
+    \item \textbf{Corrupted Logit:} 0.0208 (Probability: 0.0000)
+\end{itemize}
+
+When I patched the activations of L5H5 alone, the target logit recovered from 0.0208 to 0.4151, yielding a causal impact of +0.3942 logits. Crucially, the final probability of predicting the correct target token remained at 0.0000, implying that L5H5 alone does not write enough activation strength to change the model's behavior.
+
+Next, I patched the full induction ensemble (L5H5, L5H1, L6H9, and L7H10) simultaneously. This recovered the logit value to 5.6921, representing an ensemble causal impact of +5.6712 logits. 
+
+This comparison reveals that the induction mechanism is a distributed, multi-head circuit. A single head is causally active but insufficient; the model requires the additive write-strengths of multiple parallel heads to successfully complete the copying task in-context.
+
+\section{Emulating Literature \& Scaling Limitations}
+
+\subsection{The Ablation Crash}
+
+To evaluate how much ICL performance depends on these induction heads, I performed zero-ablation on the Exact Sequence Continuation task. I compared the target prediction confidence of the full model against runs where the top ten induction heads, and a control set of ten random heads, were zeroed out.
+
+The results show a stark contrast:
+\begin{itemize}
+    \item \textbf{Full Model Baseline:} 75.8\% Confidence
+    \item \textbf{Induction Head Ablation:} 11.8\% Confidence (-64.0\% change)
+    \item \textbf{Random Head Ablation:} 68.1\% Confidence (-7.7\% change)
+\end{itemize}
+
+The severe crash in ICL performance upon ablating the induction circuit (-64.0\%) vs. the minor drop for random heads (-7.7\%) confirms that the induction heads are necessary for few-shot learning in GPT-2 Small.
+
+\subsection{The Scaling Limitation: Structural vs. Semantic Induction}
+
+These results match the findings in the literature, but they also expose a critical scaling limitation. In their evaluation of Llama-3-8B and InternLM2-20B, \citet{crosbie2024} successfully demonstrated "Fuzzy Semantic Continuation," where induction heads map semantic category relations (e.g., mapping category sequences like \textit{fruit $\rightarrow$ animal} across instances of different words). 
+
+When I attempted to replicate this semantic category continuation in GPT-2 Small, the model failed. This failure shows the capacity limit of smaller models. Mapping semantic categories requires the model's QK circuit to compute matches between abstract concept vectors in the residual stream, rather than matching direct token embeddings. Because GPT-2 Small is relatively small (124M parameters), its representational space is crowded and lacks the capacity to store high-dimensional, abstract category bounds that can compose cleanly with attention heads.
+
+Thus, the induction heads in GPT-2 Small are strictly structural: they can copy tokens that match exactly, but they fail to generalize to semantic concepts. I had to use an "Exact Continuation" task to bypass these model capacity constraints, proving that the structural logic of the induction circuit is present, but its semantic capabilities scale with parameter count.
+
+\section{Indirect Object Identification \& Circuit Redundancy}
+
+\subsection{Name Mover Heads}
+
+I next evaluated semantic circuits using the templated IOI dataset. I applied direct logit attribution to Layer 9 Head 9 (L9H9), which is identified as a primary Name Mover Head. 
+
+Projecting the output of L9H9 directly to the unembedding layer on the IOI task yielded an average logit of +0.6687 for the correct target name (Name A), and 0.0000 for all other tokens. This confirms that L9H9 operates as a Name Mover Head, writing the correct name's vector directly to the final token's residual stream.
+
+\subsection{The Backup Head Discovery}
+
+To replicate the backup name mover circuit redundancy from \citet{wang2022}, I zero-ablated the three primary Name Mover Heads (9.9, 9.6, and 10.0) and evaluated the correct target logit:
+\begin{itemize}
+    \item \textbf{Clean Target Logit:} 4.7316
+    \item \textbf{Logit after Ablating Primary Name Movers:} 4.4870
+\end{itemize}
+
+Interestingly, completely disabling the primary circuit caused the target logit to drop by only 0.2446 (from 4.7316 to 4.4870). This result replicates the backup head phenomenon. When the primary Name Movers are silenced, downstream heads increase their attention to the target name to compensate. 
+
+This compensation is mediated by LayerNorm calibration: the loss of primary activations decreases the variance of the residual stream, causing the LayerNorm layer to scale up the write-strength of the remaining heads.
+\section{Conclusion \& Limitations}
+
+In this paper, I successfully mapped and causal-tested two computational circuits in GPT-2 Small: the structural induction circuit and the semantic IOI circuit. Using observational, causal, and ablation interventions, I validated their functions and compared my results with those of larger models.
+
+My work has several limitations. Due to computational constraints, I did not train a Sparse Autoencoder (SAE) to decompose activations, nor did I replicate these experiments on larger models (such as Llama-3-8B).
+
+\bibliography{custom}
+
+\end{document}
