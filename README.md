@@ -65,5 +65,5 @@ python nlp_project_main.py
 ## Citation & Reference
 If you want to read the full details of this research, please check the [LaTeX paper](induction_heads.tex) included in the repo.
 
-* **Author**: Artur Safrastyan ([artur.safrastyan@email.com])
+* **Author**: Artur Safrastyan
 * **Git Repository**: [https://github.com/artursafrastyan-uni/nlp_project](https://github.com/artursafrastyan-uni/nlp_project)
